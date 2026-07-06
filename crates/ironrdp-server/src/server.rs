@@ -1509,7 +1509,8 @@ impl RdpServer {
         // Validate credentials if a validator is configured. The validator runs here, in the
         // async server layer, rather than in the sans-I/O acceptor, because real validators
         // (PAM/LDAP/DB) are I/O-bound. On rejection, deny with a ServerSetErrorInfoPdu before
-        // closing, matching the acceptor's exact-match denial path.
+        // closing, matching the acceptor's exact-match denial path. Reactivation still resolves
+        // credentials so clients that resend them are re-validated before channel state is reused.
         let authenticated_credentials = match resolve_authenticated_credentials(
             self.credential_validator.clone(),
             result.credentials.as_ref(),

@@ -38,6 +38,7 @@ pub struct Acceptor {
     saved_for_reactivation: AcceptorState,
     pub(crate) creds: Option<Credentials>,
     received_credentials: Option<Credentials>,
+    received_credentials_origin: Option<CredentialOrigin>,
     reactivation: bool,
     honor_client_desktop_size: bool,
 }
@@ -74,6 +75,14 @@ fn set_bitmap_desktop_size(capabilities: &mut [CapabilitySet], size: DesktopSize
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CredentialOrigin {
+    /// Received in the ClientInfoPdu (MS-RDPBCGR 2.2.1.11); not authenticated by the handshake.
+    ClientInfo,
+    /// Delegated TSPasswordCreds decrypted by CredSSP (MS-CSSP); authenticated by the exchange.
+    CredSspDelegated,
+}
+
 #[derive(Debug)]
 pub struct AcceptorResult {
     pub static_channels: StaticChannelSet,
@@ -104,8 +113,11 @@ pub struct AcceptorResult {
     /// delegated TSPasswordCreds have been decrypted by CredSSP.
     ///
     /// Servers that need to validate credentials (e.g., via PAM or LDAP)
-    /// can use this field for post-handshake validation.
+    /// can use this field for post-handshake validation. Check
+    /// [`Self::credentials_origin`] to distinguish unauthenticated ClientInfo
+    /// credentials from CredSSP-delegated credentials authenticated by the exchange.
     pub credentials: Option<Credentials>,
+    pub credentials_origin: Option<CredentialOrigin>,
 }
 
 impl Acceptor {
@@ -128,6 +140,7 @@ impl Acceptor {
             saved_for_reactivation: Default::default(),
             creds,
             received_credentials: None,
+            received_credentials_origin: None,
             reactivation: false,
             honor_client_desktop_size: false,
         }
@@ -200,6 +213,7 @@ impl Acceptor {
             saved_for_reactivation,
             creds: consumed.creds,
             received_credentials: consumed.received_credentials,
+            received_credentials_origin: consumed.received_credentials_origin,
             reactivation: true,
             honor_client_desktop_size: consumed.honor_client_desktop_size,
         })
@@ -241,6 +255,7 @@ impl Acceptor {
             password: identity.password.as_ref().clone(),
             domain: identity.username.domain_name().map(str::to_owned),
         });
+        self.received_credentials_origin = Some(CredentialOrigin::CredSspDelegated);
     }
 
     /// # Panics
@@ -269,6 +284,7 @@ impl Acceptor {
                 keyboard_layout: self.keyboard_layout,
                 reactivation: self.reactivation,
                 credentials: self.received_credentials.take(),
+                credentials_origin: self.received_credentials_origin.take(),
             }),
             previous_state => {
                 self.state = previous_state;
@@ -723,6 +739,7 @@ impl Sequence for Acceptor {
 
                     // Store credentials for later retrieval via AcceptorResult.
                     self.received_credentials = Some(creds);
+                    self.received_credentials_origin = Some(CredentialOrigin::ClientInfo);
                 }
 
                 (

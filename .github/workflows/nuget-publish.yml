@@ -277,6 +277,7 @@ jobs:
       - name: Upload native components
         uses: actions/upload-artifact@v7
         with:
+          retention-days: 7
           name: ironrdp-${{matrix.os}}-${{matrix.arch}}
           path: dependencies/runtimes/${{matrix.os}}-${{matrix.arch}}
 
@@ -316,6 +317,7 @@ jobs:
       - name: Upload native components
         uses: actions/upload-artifact@v7
         with:
+          retention-days: 7
           name: ironrdp-${{ matrix.os }}-universal
           path: dependencies/runtimes/${{ matrix.os }}-universal
 
@@ -362,6 +364,7 @@ jobs:
       - name: Upload managed components
         uses: actions/upload-artifact@v7
         with:
+          retention-days: 7
           name: ironrdp-nupkg
           path: ffi/dotnet/Devolutions.IronRdp/bin/Release/*.nupkg
 

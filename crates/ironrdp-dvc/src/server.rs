@@ -180,6 +180,27 @@ impl DrdynvcServer {
         self
     }
 
+    /// Create at most one pending channel at a time.
+    ///
+    /// Some Microsoft mobile clients stop processing when a server sends a
+    /// burst of CREATE_REQUEST PDUs immediately after capability negotiation.
+    /// Serializing creation also gives deterministic priority to registration
+    /// order and keeps optional DVC failures from starving later channels.
+    fn create_next_pending(&mut self) -> PduResult<Option<SvcMessage>> {
+        let Some((id, channel)) = self
+            .dynamic_channels
+            .dynamic_channels
+            .iter_mut()
+            .find(|(_, channel)| channel.state == ChannelState::Pending)
+        else {
+            return Ok(None);
+        };
+
+        let request = DrdynvcServerPdu::Create(CreateRequestPdu::new(*id, channel.processor.channel_name().into()));
+        channel.state = ChannelState::Creation;
+        as_svc_msg_with_flag(request).map(Some)
+    }
+
     fn channel_by_id(&mut self, id: u32) -> DecodeResult<&mut DynamicChannel> {
         self.dynamic_channels
             .get_mut(id)
@@ -279,29 +300,32 @@ impl SvcProcessor for DrdynvcServer {
         match pdu {
             DrdynvcClientPdu::Capabilities(caps_resp) => {
                 debug!("Got DVC Capabilities Response PDU: {caps_resp:?}");
-                for (id, c) in &mut self.dynamic_channels {
-                    if c.state != ChannelState::Pending {
-                        continue;
-                    }
-                    let req = DrdynvcServerPdu::Create(CreateRequestPdu::new(*id, c.processor.channel_name().into()));
-                    c.state = ChannelState::Creation;
-                    resp.push(as_svc_msg_with_flag(req)?);
+                if let Some(request) = self.create_next_pending()? {
+                    resp.push(request);
                 }
             }
             DrdynvcClientPdu::Create(create_resp) => {
                 debug!("Got DVC Create Response PDU: {create_resp:?}");
                 let id = create_resp.channel_id();
-                let c = self.channel_by_id(id).map_err(|e| decode_err!(e))?;
-                if c.state != ChannelState::Creation {
-                    return Err(pdu_other_err!("invalid channel state"));
+                {
+                    let channel = self.channel_by_id(id).map_err(|e| decode_err!(e))?;
+                    if channel.state != ChannelState::Creation {
+                        return Err(pdu_other_err!("invalid channel state"));
+                    }
+                    if create_resp.creation_status() == CreationStatus::OK {
+                        channel.state = ChannelState::Opened;
+                        let messages = channel.processor.start(id)?;
+                        resp.extend(
+                            encode_dvc_messages(id, messages, ChannelFlags::SHOW_PROTOCOL)
+                                .map_err(|e| encode_err!(e))?,
+                        );
+                    } else {
+                        channel.state = ChannelState::CreationFailed(create_resp.creation_status().into());
+                    }
                 }
-                if create_resp.creation_status() != CreationStatus::OK {
-                    c.state = ChannelState::CreationFailed(create_resp.creation_status().into());
-                    return Ok(resp);
+                if let Some(request) = self.create_next_pending()? {
+                    resp.push(request);
                 }
-                c.state = ChannelState::Opened;
-                let msg = c.processor.start(create_resp.channel_id())?;
-                resp.extend(encode_dvc_messages(id, msg, ChannelFlags::SHOW_PROTOCOL).map_err(|e| encode_err!(e))?);
             }
             DrdynvcClientPdu::Close(close) => {
                 debug!("Got DVC Close PDU: {close:?}");

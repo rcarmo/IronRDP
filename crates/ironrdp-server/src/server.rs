@@ -1524,7 +1524,6 @@ impl RdpServer {
         W: FramedWrite,
     {
         debug!("Client accepted");
-        self.clear_bound_connection().await;
 
         // Validate credentials if a validator is configured. The validator runs here, in the
         // async server layer, rather than in the sans-I/O acceptor, because real validators
@@ -1934,6 +1933,11 @@ impl RdpServer {
     where
         S: AsyncRead + AsyncWrite + Sync + Send + Unpin,
     {
+        // Clear per-user resources once for this TCP connection. Do not clear
+        // inside the loop: reactivation re-enters client_accepted without
+        // rebinding, and must keep the existing display/input handlers.
+        self.clear_bound_connection().await;
+
         loop {
             let (new_framed, result) = ironrdp_acceptor::accept_finalize(framed, &mut acceptor)
                 .await

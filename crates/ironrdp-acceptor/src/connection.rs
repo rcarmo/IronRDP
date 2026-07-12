@@ -523,13 +523,7 @@ impl Sequence for Acceptor {
 
                 let gcc_blocks = settings_initial.conference_create_request.into_gcc_blocks();
                 let early_capability = gcc_blocks.core.optional_data.early_capability_flags;
-                // Do not advertise the optional MCS Message Channel here. The
-                // Microsoft mobile client successfully negotiated rdpgfx with
-                // the earlier channel topology, but stops acknowledging DVC
-                // CREATE_REQUEST PDUs when this extra channel is present.
-                // RDPGFX, DisplayControl, ECHO, clipboard, audio, and input do
-                // not require the Message Channel.
-                self.message_channel_id = None;
+                let client_wants_message_channel = gcc_blocks.message_channel.is_some();
                 self.keyboard_layout = gcc_blocks.core.keyboard_layout;
 
                 // Adopt the client's requested desktop size (from its Client
@@ -587,6 +581,16 @@ impl Sequence for Acceptor {
                         }
                     })
                     .collect();
+
+                if client_wants_message_channel {
+                    // Allocate the message channel ID after the I/O channel and
+                    // any static virtual channels. It is advertised in Server
+                    // Message Channel Data and joined alongside the others.
+                    #[expect(clippy::arithmetic_side_effects)] // IO channel ID is not big enough for overflowing.
+                    let channel_id =
+                        u16::try_from(channels.len()).expect("always in the range") + self.io_channel_id + 1;
+                    self.message_channel_id = Some(channel_id);
+                }
 
                 (
                     Written::Nothing,

@@ -69,7 +69,9 @@ impl DynamicChannelAllocator {
     fn new() -> Self {
         Self {
             dynamic_channels: BTreeMap::new(),
-            next_channel_id: 0,
+            // Keep zero unused. xrdp and Windows-compatible server paths allocate
+            // the first server-created DVC as ID 1.
+            next_channel_id: 1,
         }
     }
 
@@ -374,4 +376,77 @@ fn decode_dvc_message(user_data: &[u8]) -> DecodeResult<DrdynvcClientPdu> {
 
 fn as_svc_msg_with_flag(pdu: DrdynvcServerPdu) -> PduResult<SvcMessage> {
     Ok(SvcMessage::from(pdu).with_flags(ChannelFlags::SHOW_PROTOCOL))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::DvcMessage;
+
+    struct GraphicsChannel;
+    impl_as_any!(GraphicsChannel);
+
+    impl DvcProcessor for GraphicsChannel {
+        fn channel_name(&self) -> &str {
+            "Microsoft::Windows::RDS::Graphics"
+        }
+
+        fn start(&mut self, _channel_id: u32) -> PduResult<Vec<DvcMessage>> {
+            Ok(Vec::new())
+        }
+
+        fn process(&mut self, _channel_id: u32, _payload: &[u8]) -> PduResult<Vec<DvcMessage>> {
+            Ok(Vec::new())
+        }
+    }
+
+    impl DvcServerProcessor for GraphicsChannel {}
+
+    struct OtherChannel;
+    impl_as_any!(OtherChannel);
+
+    impl DvcProcessor for OtherChannel {
+        fn channel_name(&self) -> &str {
+            "example.other"
+        }
+
+        fn start(&mut self, _channel_id: u32) -> PduResult<Vec<DvcMessage>> {
+            Ok(Vec::new())
+        }
+
+        fn process(&mut self, _channel_id: u32, _payload: &[u8]) -> PduResult<Vec<DvcMessage>> {
+            Ok(Vec::new())
+        }
+    }
+
+    impl DvcServerProcessor for OtherChannel {}
+
+    #[test]
+    fn first_registered_channel_uses_id_one() {
+        let server = DrdynvcServer::new()
+            .with_dynamic_channel(GraphicsChannel)
+            .with_dynamic_channel(OtherChannel);
+
+        assert_eq!(server.get_channel_id_by_type::<GraphicsChannel>(), Some(1));
+        assert_eq!(server.get_channel_id_by_type::<OtherChannel>(), Some(2));
+    }
+
+    #[test]
+    fn capability_response_creates_graphics_first_and_routes_its_response() {
+        let mut server = DrdynvcServer::new()
+            .with_dynamic_channel(GraphicsChannel)
+            .with_dynamic_channel(OtherChannel);
+
+        // DYNVC_CAPS_RSP, version 3.
+        let requests = server.process(&[0x50, 0x00, 0x03, 0x00]).unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(server.dynamic_channels.get(1).unwrap().state, ChannelState::Creation);
+        assert_eq!(server.dynamic_channels.get(2).unwrap().state, ChannelState::Pending);
+
+        // DYNVC_CREATE_RSP, channel ID 1, status STATUS_SUCCESS.
+        let requests = server.process(&[0x10, 0x01, 0x00, 0x00, 0x00, 0x00]).unwrap();
+        assert_eq!(requests.len(), 1);
+        assert!(server.dvc_by_id::<GraphicsChannel>(1).is_some());
+        assert_eq!(server.dynamic_channels.get(2).unwrap().state, ChannelState::Creation);
+    }
 }

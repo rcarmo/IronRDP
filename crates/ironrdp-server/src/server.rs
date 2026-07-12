@@ -713,33 +713,32 @@ impl RdpServer {
             acceptor.attach_static_channel(RdpsndServer::new(backend));
         }
 
+        // Register EGFX first so the first server-created DVC is rdpgfx ID 1,
+        // matching xrdp's negotiation sequence. Creation is still serialized by
+        // DrdynvcServer, so this does not reintroduce the previous request burst.
+        let mut dvc = dvc::DrdynvcServer::new();
+
+        #[cfg(feature = "egfx")]
+        if let Some(gfx_factory) = self.gfx_factory.as_deref() {
+            if let Some((bridge, handle)) = gfx_factory.build_server_with_handle() {
+                self.gfx_handle = Some(handle);
+                dvc = dvc.with_dynamic_channel(bridge);
+            } else {
+                let handler = gfx_factory.build_gfx_handler();
+                let gfx_server = ironrdp_egfx::server::GraphicsPipelineServer::new(handler);
+                dvc = dvc.with_dynamic_channel(gfx_server);
+            }
+        }
+
         let dcs_backend = DisplayControlBackend::new(Arc::clone(&self.display));
-        let dvc = dvc::DrdynvcServer::new()
+        let dvc = dvc
             .with_dynamic_channel(AInputHandler {
                 handler: Arc::clone(&self.handler),
             })
             .with_dynamic_channel(DisplayControlServer::new(Box::new(dcs_backend)));
 
-        let dvc = {
-            let echo_handle = self.echo_handle.clone();
-            dvc.with_dynamic_channel(EchoDvcBridge::new(echo_handle))
-        };
-
-        #[cfg(feature = "egfx")]
-        let dvc = {
-            let mut dvc = dvc;
-            if let Some(gfx_factory) = self.gfx_factory.as_deref() {
-                if let Some((bridge, handle)) = gfx_factory.build_server_with_handle() {
-                    self.gfx_handle = Some(handle);
-                    dvc = dvc.with_dynamic_channel(bridge);
-                } else {
-                    let handler = gfx_factory.build_gfx_handler();
-                    let gfx_server = ironrdp_egfx::server::GraphicsPipelineServer::new(handler);
-                    dvc = dvc.with_dynamic_channel(gfx_server);
-                }
-            }
-            dvc
-        };
+        let echo_handle = self.echo_handle.clone();
+        let dvc = dvc.with_dynamic_channel(EchoDvcBridge::new(echo_handle));
 
         acceptor.attach_static_channel(dvc);
     }

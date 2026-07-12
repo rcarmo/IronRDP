@@ -99,6 +99,12 @@ impl SvcMessage {
         self
     }
 
+    /// Returns the additional channel flags requested for this message.
+    #[must_use]
+    pub fn flags(&self) -> ChannelFlags {
+        self.flags
+    }
+
     /// Encodes the inner PDU without SVC channel framing headers.
     ///
     /// Returns the raw PDU bytes for transports that handle their own framing

@@ -1212,8 +1212,7 @@ impl RdpServer {
                         self.echo_handle.on_request_sent(&payload);
 
                         let request = build_echo_request(payload)?;
-                        let messages =
-                            dvc::encode_dvc_messages(echo_channel_id, vec![request], ChannelFlags::SHOW_PROTOCOL)?;
+                        let messages = dvc::encode_dvc_messages(echo_channel_id, vec![request], ChannelFlags::empty())?;
 
                         let drdynvc_channel_id = self
                             .get_channel_id_by_type::<dvc::DrdynvcServer>()

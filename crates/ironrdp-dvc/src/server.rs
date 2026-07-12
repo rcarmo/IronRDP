@@ -260,7 +260,7 @@ impl DrdynvcServer {
         debug!(channel_id = id, channel_name, "Sending serialized DVC Create Request");
         let request = DrdynvcServerPdu::Create(CreateRequestPdu::new(id, channel_name.into()));
         channel.state = ChannelState::Creation;
-        as_svc_msg_with_flag(request).map(Some)
+        as_svc_msg(request).map(Some)
     }
 
     /// Replays a capability request interrupted by Share Control
@@ -276,7 +276,7 @@ impl DrdynvcServer {
                 debug!("Replaying DRDYNVC Capabilities Request after reactivation");
                 let cap = CapabilitiesRequestPdu::new(CapsVersion::V2, None);
                 let req = DrdynvcServerPdu::Capabilities(cap);
-                Ok(alloc::vec![as_svc_msg_with_flag(req)?])
+                Ok(alloc::vec![as_svc_msg(req)?])
             }
             DrdynvcState::Ready | DrdynvcState::Failed => Ok(Vec::new()),
         }
@@ -325,7 +325,7 @@ impl DrdynvcServer {
 
         let channel_id = self.dynamic_channels.insert_channel(channel, ChannelState::Creation);
         let req = DrdynvcServerPdu::Create(CreateRequestPdu::new(channel_id, channel_name));
-        as_svc_msg_with_flag(req)
+        as_svc_msg(req)
     }
 
     fn remove_by_channel_id(&mut self, id: u32) -> Option<DynamicChannel> {
@@ -343,10 +343,7 @@ impl DrdynvcServer {
 
     pub fn close_channel(&mut self, channel_id: u32) -> Option<SvcMessage> {
         self.remove_by_channel_id(channel_id)?;
-        Some(
-            SvcMessage::from(DrdynvcServerPdu::Close(ClosePdu::new(channel_id)))
-                .with_flags(ChannelFlags::SHOW_PROTOCOL),
-        )
+        Some(SvcMessage::from(DrdynvcServerPdu::Close(ClosePdu::new(channel_id))))
     }
 }
 
@@ -374,7 +371,7 @@ impl SvcProcessor for DrdynvcServer {
 
         let cap = CapabilitiesRequestPdu::new(CapsVersion::V2, None);
         let req = DrdynvcServerPdu::Capabilities(cap);
-        let msg = as_svc_msg_with_flag(req)?;
+        let msg = as_svc_msg(req)?;
         self.state = DrdynvcState::CapabilitiesSent;
         Ok(alloc::vec![msg])
     }
@@ -418,8 +415,7 @@ impl SvcProcessor for DrdynvcServer {
                         channel.state = ChannelState::Opened;
                         let messages = channel.processor.start(id)?;
                         resp.extend(
-                            encode_dvc_messages(id, messages, ChannelFlags::SHOW_PROTOCOL)
-                                .map_err(|e| encode_err!(e))?,
+                            encode_dvc_messages(id, messages, ChannelFlags::empty()).map_err(|e| encode_err!(e))?,
                         );
                     } else {
                         channel.state = ChannelState::CreationFailed(create_resp.creation_status().into());
@@ -444,8 +440,7 @@ impl SvcProcessor for DrdynvcServer {
                 if let Some(complete) = c.complete_data.process_data(data).map_err(|e| decode_err!(e))? {
                     let msg = c.processor.process(channel_id, &complete)?;
                     resp.extend(
-                        encode_dvc_messages(channel_id, msg, ChannelFlags::SHOW_PROTOCOL)
-                            .map_err(|e| encode_err!(e))?,
+                        encode_dvc_messages(channel_id, msg, ChannelFlags::empty()).map_err(|e| encode_err!(e))?,
                     );
                 }
             }
@@ -461,8 +456,10 @@ fn decode_dvc_message(user_data: &[u8]) -> DecodeResult<DrdynvcClientPdu> {
     DrdynvcClientPdu::decode(&mut ReadCursor::new(user_data))
 }
 
-fn as_svc_msg_with_flag(pdu: DrdynvcServerPdu) -> PduResult<SvcMessage> {
-    Ok(SvcMessage::from(pdu).with_flags(ChannelFlags::SHOW_PROTOCOL))
+fn as_svc_msg(pdu: DrdynvcServerPdu) -> PduResult<SvcMessage> {
+    // Match xrdp framing: the SVC encoder adds FIRST | LAST for an unfragmented
+    // packet; DRDYNVC does not add CHANNEL_FLAG_SHOW_PROTOCOL.
+    Ok(SvcMessage::from(pdu))
 }
 
 #[cfg(test)]
@@ -587,11 +584,14 @@ mod tests {
             .with_dynamic_channel(GraphicsChannel)
             .with_dynamic_channel(OtherChannel);
 
-        server.start().unwrap();
+        let capabilities = server.start().unwrap();
+        assert_eq!(capabilities.len(), 1);
+        assert_eq!(capabilities[0].flags(), ChannelFlags::empty());
 
         // DYNVC_CAPS_RSP, version 3.
         let requests = server.process(&[0x50, 0x00, 0x03, 0x00]).unwrap();
         assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].flags(), ChannelFlags::empty());
         assert_eq!(server.dynamic_channels.get(1).unwrap().state, ChannelState::Creation);
         assert_eq!(server.dynamic_channels.get(2).unwrap().state, ChannelState::Pending);
 

@@ -713,10 +713,18 @@ impl RdpServer {
             acceptor.attach_static_channel(RdpsndServer::new(backend));
         }
 
-        // Register rdpgfx first. DrdynvcServer serializes CREATE_REQUEST PDUs,
-        // so registration order is also negotiation priority. Graphics must not
-        // be blocked behind optional Advanced Input, DisplayControl, or ECHO.
-        let dvc = dvc::DrdynvcServer::new();
+        let dcs_backend = DisplayControlBackend::new(Arc::clone(&self.display));
+        let dvc = dvc::DrdynvcServer::new()
+            .with_dynamic_channel(AInputHandler {
+                handler: Arc::clone(&self.handler),
+            })
+            .with_dynamic_channel(DisplayControlServer::new(Box::new(dcs_backend)));
+
+        let dvc = {
+            let echo_handle = self.echo_handle.clone();
+            dvc.with_dynamic_channel(EchoDvcBridge::new(echo_handle))
+        };
+
         #[cfg(feature = "egfx")]
         let dvc = {
             let mut dvc = dvc;
@@ -732,15 +740,6 @@ impl RdpServer {
             }
             dvc
         };
-
-        let dcs_backend = DisplayControlBackend::new(Arc::clone(&self.display));
-        let dvc = dvc
-            .with_dynamic_channel(AInputHandler {
-                handler: Arc::clone(&self.handler),
-            })
-            .with_dynamic_channel(DisplayControlServer::new(Box::new(dcs_backend)));
-        let echo_handle = self.echo_handle.clone();
-        let dvc = dvc.with_dynamic_channel(EchoDvcBridge::new(echo_handle));
 
         acceptor.attach_static_channel(dvc);
     }

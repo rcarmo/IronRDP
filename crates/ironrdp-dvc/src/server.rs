@@ -184,19 +184,33 @@ impl DrdynvcServer {
     ///
     /// Some Microsoft mobile clients stop processing when a server sends a
     /// burst of CREATE_REQUEST PDUs immediately after capability negotiation.
-    /// Serializing creation also gives deterministic priority to registration
-    /// order and keeps optional DVC failures from starving later channels.
+    /// Serialize creation and negotiate rdpgfx first, while retaining its
+    /// registered channel ID for compatibility with clients that remember the
+    /// original server topology.
     fn create_next_pending(&mut self) -> PduResult<Option<SvcMessage>> {
-        let Some((id, channel)) = self
-            .dynamic_channels
-            .dynamic_channels
-            .iter_mut()
-            .find(|(_, channel)| channel.state == ChannelState::Pending)
-        else {
+        const RDPGFX_CHANNEL_NAME: &str = "Microsoft::Windows::RDS::Graphics";
+
+        let channels = &self.dynamic_channels.dynamic_channels;
+        let selected_id = channels
+            .iter()
+            .find(|(_, channel)| {
+                channel.state == ChannelState::Pending && channel.processor.channel_name() == RDPGFX_CHANNEL_NAME
+            })
+            .or_else(|| {
+                channels
+                    .iter()
+                    .find(|(_, channel)| channel.state == ChannelState::Pending)
+            })
+            .map(|(id, _)| *id);
+        let Some(id) = selected_id else {
             return Ok(None);
         };
 
-        let request = DrdynvcServerPdu::Create(CreateRequestPdu::new(*id, channel.processor.channel_name().into()));
+        let channel = self
+            .dynamic_channels
+            .get_mut(id)
+            .ok_or_else(|| pdu_other_err!("selected dynamic channel disappeared"))?;
+        let request = DrdynvcServerPdu::Create(CreateRequestPdu::new(id, channel.processor.channel_name().into()));
         channel.state = ChannelState::Creation;
         as_svc_msg_with_flag(request).map(Some)
     }

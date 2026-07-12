@@ -675,6 +675,10 @@ impl CapabilitiesResponsePdu {
         }
     }
 
+    pub fn version(&self) -> CapsVersion {
+        self.version
+    }
+
     fn decode(header: Header, src: &mut ReadCursor<'_>) -> DecodeResult<Self> {
         ensure_size!(in: src, size: Self::HEADERLESS_FIXED_PART_SIZE);
         let _pad = src.read_u8();

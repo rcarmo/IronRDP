@@ -27,6 +27,14 @@ enum ChannelState {
     CreationFailed(u32),
 }
 
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+enum DrdynvcState {
+    Initial,
+    CapabilitiesSent,
+    Ready,
+    Failed,
+}
+
 struct DynamicChannel {
     state: ChannelState,
     processor: Box<dyn DvcProcessor>,
@@ -123,6 +131,7 @@ impl DynamicChannel {
 ///
 /// It adds support for dynamic virtual channels (DVC).
 pub struct DrdynvcServer {
+    state: DrdynvcState,
     dynamic_channels: DynamicChannelAllocator,
     type_id_to_channel_id: BTreeMap<TypeId, u32>,
 }
@@ -147,6 +156,7 @@ impl DrdynvcServer {
 
     pub fn new() -> Self {
         Self {
+            state: DrdynvcState::Initial,
             dynamic_channels: DynamicChannelAllocator::new(),
             type_id_to_channel_id: BTreeMap::new(),
         }
@@ -302,9 +312,14 @@ impl SvcProcessor for DrdynvcServer {
     }
 
     fn start(&mut self) -> PduResult<Vec<SvcMessage>> {
+        if self.state != DrdynvcState::Initial {
+            return Err(pdu_other_err!("DRDYNVC capability negotiation already started"));
+        }
+
         let cap = CapabilitiesRequestPdu::new(CapsVersion::V2, None);
         let req = DrdynvcServerPdu::Capabilities(cap);
         let msg = as_svc_msg_with_flag(req)?;
+        self.state = DrdynvcState::CapabilitiesSent;
         Ok(alloc::vec![msg])
     }
 
@@ -315,12 +330,24 @@ impl SvcProcessor for DrdynvcServer {
         match pdu {
             DrdynvcClientPdu::Capabilities(caps_resp) => {
                 debug!("Got DVC Capabilities Response PDU: {caps_resp:?}");
+                if self.state != DrdynvcState::CapabilitiesSent {
+                    return Err(pdu_other_err!("unexpected DRDYNVC capability response"));
+                }
+                if !matches!(caps_resp.version(), CapsVersion::V2 | CapsVersion::V3) {
+                    self.state = DrdynvcState::Failed;
+                    return Err(pdu_other_err!("unsupported DRDYNVC capability version"));
+                }
+
+                self.state = DrdynvcState::Ready;
                 if let Some(request) = self.create_next_pending()? {
                     resp.push(request);
                 }
             }
             DrdynvcClientPdu::Create(create_resp) => {
                 debug!("Got DVC Create Response PDU: {create_resp:?}");
+                if self.state != DrdynvcState::Ready {
+                    return Err(pdu_other_err!("DVC create response before capability negotiation"));
+                }
                 let id = create_resp.channel_id();
                 {
                     let channel = self.channel_by_id(id).map_err(|e| decode_err!(e))?;
@@ -432,10 +459,45 @@ mod tests {
     }
 
     #[test]
+    fn capability_response_requires_a_started_handshake() {
+        let mut server = DrdynvcServer::new().with_dynamic_channel(GraphicsChannel);
+
+        assert!(server.process(&[0x50, 0x00, 0x03, 0x00]).is_err());
+        assert_eq!(server.state, DrdynvcState::Initial);
+        assert_eq!(server.dynamic_channels.get(1).unwrap().state, ChannelState::Pending);
+    }
+
+    #[test]
+    fn version_one_capability_response_fails_negotiation() {
+        let mut server = DrdynvcServer::new().with_dynamic_channel(GraphicsChannel);
+        server.start().unwrap();
+
+        assert!(server.process(&[0x50, 0x00, 0x01, 0x00]).is_err());
+        assert_eq!(server.state, DrdynvcState::Failed);
+        assert_eq!(server.dynamic_channels.get(1).unwrap().state, ChannelState::Pending);
+    }
+
+    #[test]
+    fn duplicate_capability_response_cannot_start_another_create() {
+        let mut server = DrdynvcServer::new()
+            .with_dynamic_channel(GraphicsChannel)
+            .with_dynamic_channel(OtherChannel);
+        server.start().unwrap();
+
+        server.process(&[0x50, 0x00, 0x03, 0x00]).unwrap();
+        assert!(server.process(&[0x50, 0x00, 0x03, 0x00]).is_err());
+        assert_eq!(server.state, DrdynvcState::Ready);
+        assert_eq!(server.dynamic_channels.get(1).unwrap().state, ChannelState::Creation);
+        assert_eq!(server.dynamic_channels.get(2).unwrap().state, ChannelState::Pending);
+    }
+
+    #[test]
     fn capability_response_creates_graphics_first_and_routes_its_response() {
         let mut server = DrdynvcServer::new()
             .with_dynamic_channel(GraphicsChannel)
             .with_dynamic_channel(OtherChannel);
+
+        server.start().unwrap();
 
         // DYNVC_CAPS_RSP, version 3.
         let requests = server.process(&[0x50, 0x00, 0x03, 0x00]).unwrap();

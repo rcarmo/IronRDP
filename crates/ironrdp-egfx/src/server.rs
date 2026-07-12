@@ -766,6 +766,12 @@ pub trait GraphicsPipelineHandler: Send {
     /// The handler should create surfaces and start sending frames.
     fn on_ready(&mut self, negotiated: &CapabilitySet);
 
+    /// Called when the client and server have no compatible capability set or
+    /// the client's advertisement is malformed.
+    ///
+    /// The RDP connection may continue using a non-EGFX graphics path.
+    fn on_capability_negotiation_failed(&mut self) {}
+
     /// Called when a frame has been acknowledged by the client
     ///
     /// `total_frames_decoded` is the client's running decoded-frame count
@@ -834,6 +840,8 @@ enum ServerState {
     WaitingForCapabilities,
     /// Channel is ready, can send frames
     Ready,
+    /// Capability negotiation completed without a compatible capability set.
+    NegotiationFailed,
     /// Performing a resize operation
     Resizing,
     /// Channel has been closed
@@ -1639,6 +1647,11 @@ impl GraphicsPipelineServer {
     // ========================================================================
 
     fn handle_capabilities_advertise(&mut self, pdu: CapabilitiesAdvertisePdu) {
+        if self.state != ServerState::WaitingForCapabilities {
+            warn!(state = ?self.state, "Ignoring RDPGFX capability advertisement in invalid state");
+            return;
+        }
+
         self.handler.capabilities_advertise(&pdu);
         let server_caps = self.handler.preferred_capabilities();
 
@@ -1652,23 +1665,20 @@ impl GraphicsPipelineServer {
                 Ok(Some(cap)) => client_caps.push(cap),
                 Ok(None) => {}
                 Err(e) => {
-                    warn!(error = ?e, "Received malformed client capability set; aborting capability negotiation");
+                    warn!(error = ?e, "Received malformed client capability set; rejecting EGFX negotiation");
+                    self.state = ServerState::NegotiationFailed;
+                    self.handler.on_capability_negotiation_failed();
                     return;
                 }
             }
         }
 
-        // When no version overlaps with server preferences, confirm the client's
-        // highest-priority capability to avoid confirming a version the client
-        // did not advertise.
-        let negotiated = negotiate_capabilities(&client_caps, &server_caps).unwrap_or_else(|| {
-            warn!("No capability match with server preferences, selecting client's highest version");
-            let mut client_sorted = client_caps.clone();
-            client_sorted.sort_by_key(|cap| core::cmp::Reverse(capability_priority(cap)));
-            client_sorted.into_iter().next().unwrap_or(CapabilitySet::V8 {
-                flags: CapabilitiesV8Flags::empty(),
-            })
-        });
+        let Some(negotiated) = negotiate_capabilities(&client_caps, &server_caps) else {
+            warn!("No compatible RDPGFX capability set; retaining non-EGFX graphics path");
+            self.state = ServerState::NegotiationFailed;
+            self.handler.on_capability_negotiation_failed();
+            return;
+        };
 
         self.codec_caps = CodecCapabilities::from_capability_set(&negotiated);
         self.state = ServerState::Ready;
@@ -1780,4 +1790,74 @@ fn encode_avc444_bitmap_stream(stream: &Avc444BitmapStream<'_>) -> Vec<u8> {
         .expect("encode_avc444_bitmap_stream: encoding failed");
 
     buf
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use core::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    struct TestHandler {
+        preferred: Vec<CapabilitySet>,
+        failed: Arc<AtomicBool>,
+    }
+
+    impl GraphicsPipelineHandler for TestHandler {
+        fn capabilities_advertise(&mut self, _pdu: &CapabilitiesAdvertisePdu) {}
+
+        fn on_ready(&mut self, _negotiated: &CapabilitySet) {}
+
+        fn on_capability_negotiation_failed(&mut self) {
+            self.failed.store(true, Ordering::Release);
+        }
+
+        fn preferred_capabilities(&self) -> Vec<CapabilitySet> {
+            self.preferred.clone()
+        }
+    }
+
+    #[test]
+    fn incompatible_capabilities_fail_without_confirmation() {
+        let failed = Arc::new(AtomicBool::new(false));
+        let handler = TestHandler {
+            preferred: vec![CapabilitySet::V10 {
+                flags: CapabilitiesV10Flags::empty(),
+            }],
+            failed: Arc::clone(&failed),
+        };
+        let mut server = GraphicsPipelineServer::new(Box::new(handler));
+        let client = CapabilitiesAdvertisePdu::from_typed(&[CapabilitySet::V8 {
+            flags: CapabilitiesV8Flags::empty(),
+        }]);
+
+        server.handle_capabilities_advertise(client);
+
+        assert_eq!(server.state, ServerState::NegotiationFailed);
+        assert!(server.output_queue.is_empty());
+        assert!(server.negotiated_caps.is_none());
+        assert!(failed.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn compatible_capabilities_confirm_once() {
+        let failed = Arc::new(AtomicBool::new(false));
+        let caps = CapabilitySet::V10 {
+            flags: CapabilitiesV10Flags::SMALL_CACHE,
+        };
+        let handler = TestHandler {
+            preferred: vec![caps.clone()],
+            failed: Arc::clone(&failed),
+        };
+        let mut server = GraphicsPipelineServer::new(Box::new(handler));
+        let client = CapabilitiesAdvertisePdu::from_typed(&[caps]);
+
+        server.handle_capabilities_advertise(client.clone());
+        server.handle_capabilities_advertise(client);
+
+        assert_eq!(server.state, ServerState::Ready);
+        assert_eq!(server.output_queue.len(), 1);
+        assert!(server.negotiated_caps.is_some());
+        assert!(!failed.load(Ordering::Acquire));
+    }
 }

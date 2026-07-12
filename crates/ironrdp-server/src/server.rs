@@ -1419,6 +1419,20 @@ impl RdpServer {
         }
 
         self.static_channels = result.static_channels;
+
+        #[cfg(feature = "egfx")]
+        if !result.client_supports_dynamic_vc_gfx {
+            let removed = self.get_svc_processor::<dvc::DrdynvcServer>().is_some_and(|drdynvc| {
+                let bridge = drdynvc.remove_dynamic_channel::<crate::gfx::GfxDvcBridge>();
+                let direct = drdynvc.remove_dynamic_channel::<ironrdp_egfx::server::GraphicsPipelineServer>();
+                bridge || direct
+            });
+            if removed {
+                debug!("Client did not advertise dynamic-VC GFX support; RDPGFX DVC disabled");
+            }
+            self.gfx_handle = None;
+        }
+
         if !result.reactivation {
             for (_type_id, channel, channel_id) in self.static_channels.iter_mut() {
                 debug!(?channel, ?channel_id, "Start");

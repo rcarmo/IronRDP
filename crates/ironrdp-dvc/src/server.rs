@@ -169,6 +169,43 @@ impl DrdynvcServer {
         self.type_id_to_channel_id.get(&TypeId::of::<T>()).copied()
     }
 
+    /// Removes a pre-registered dynamic channel before capability negotiation starts.
+    ///
+    /// Remaining pending channels are compacted so the first server-created DVC
+    /// still uses ID 1. Once negotiation starts, channel identities are immutable.
+    pub fn remove_dynamic_channel<T>(&mut self) -> bool
+    where
+        T: DvcServerProcessor + 'static,
+    {
+        if self.state != DrdynvcState::Initial {
+            return false;
+        }
+
+        let Some(channel_id) = self.type_id_to_channel_id.remove(&TypeId::of::<T>()) else {
+            return false;
+        };
+        if self.dynamic_channels.remove(channel_id).is_none() {
+            return false;
+        }
+
+        let old_channels = core::mem::take(&mut self.dynamic_channels.dynamic_channels);
+        self.type_id_to_channel_id.clear();
+        self.dynamic_channels.next_channel_id = 1;
+        for (_, mut channel) in old_channels {
+            let channel_id = self.dynamic_channels.next_channel_id;
+            channel.channel_id = channel_id;
+            self.type_id_to_channel_id
+                .insert(channel.processor_type_id(), channel_id);
+            self.dynamic_channels.dynamic_channels.insert(channel_id, channel);
+            self.dynamic_channels.next_channel_id = self
+                .dynamic_channels
+                .next_channel_id
+                .checked_add(1)
+                .expect("dynamic channels reaches `u32::MAX`");
+        }
+        true
+    }
+
     /// Returns `true` if the DVC channel with the given ID has completed
     /// its creation handshake and is in the `Opened` state.
     pub fn is_channel_opened(&self, channel_id: u32) -> bool {
@@ -456,6 +493,21 @@ mod tests {
 
         assert_eq!(server.get_channel_id_by_type::<GraphicsChannel>(), Some(1));
         assert_eq!(server.get_channel_id_by_type::<OtherChannel>(), Some(2));
+    }
+
+    #[test]
+    fn removing_a_channel_before_start_compacts_remaining_ids() {
+        let mut server = DrdynvcServer::new()
+            .with_dynamic_channel(GraphicsChannel)
+            .with_dynamic_channel(OtherChannel);
+
+        assert!(server.remove_dynamic_channel::<GraphicsChannel>());
+        assert_eq!(server.get_channel_id_by_type::<GraphicsChannel>(), None);
+        assert_eq!(server.get_channel_id_by_type::<OtherChannel>(), Some(1));
+        assert!(!server.remove_dynamic_channel::<GraphicsChannel>());
+
+        server.start().unwrap();
+        assert!(!server.remove_dynamic_channel::<OtherChannel>());
     }
 
     #[test]

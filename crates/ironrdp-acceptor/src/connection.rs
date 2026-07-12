@@ -40,6 +40,7 @@ pub struct Acceptor {
     received_credentials: Option<Credentials>,
     reactivation: bool,
     honor_client_desktop_size: bool,
+    client_supports_dynamic_vc_gfx: bool,
 }
 
 /// Minimum and maximum desktop dimension honored from a client.
@@ -97,6 +98,11 @@ pub struct AcceptorResult {
     /// announce one. Servers can use it to pick a server-side keyboard layout
     /// matching the client without changing any local input state.
     pub keyboard_layout: u32,
+    /// Whether Client Core Data advertised SUPPORT_DYN_VC_GFX_PROTOCOL.
+    ///
+    /// Servers use this gate before opening the RDPGFX dynamic channel, matching
+    /// the eligibility check performed by xrdp.
+    pub client_supports_dynamic_vc_gfx: bool,
     /// Credentials received from the client.
     ///
     /// Present for TLS-mode connections where the client sends credentials
@@ -130,6 +136,7 @@ impl Acceptor {
             received_credentials: None,
             reactivation: false,
             honor_client_desktop_size: false,
+            client_supports_dynamic_vc_gfx: false,
         }
     }
 
@@ -202,6 +209,7 @@ impl Acceptor {
             received_credentials: consumed.received_credentials,
             reactivation: true,
             honor_client_desktop_size: consumed.honor_client_desktop_size,
+            client_supports_dynamic_vc_gfx: consumed.client_supports_dynamic_vc_gfx,
         })
     }
 
@@ -267,6 +275,7 @@ impl Acceptor {
                 io_channel_id: self.io_channel_id,
                 message_channel_id: self.message_channel_id,
                 keyboard_layout: self.keyboard_layout,
+                client_supports_dynamic_vc_gfx: self.client_supports_dynamic_vc_gfx,
                 reactivation: self.reactivation,
                 credentials: self.received_credentials.take(),
             }),
@@ -523,6 +532,8 @@ impl Sequence for Acceptor {
 
                 let gcc_blocks = settings_initial.conference_create_request.into_gcc_blocks();
                 let early_capability = gcc_blocks.core.optional_data.early_capability_flags;
+                self.client_supports_dynamic_vc_gfx = early_capability
+                    .is_some_and(|flags| flags.contains(gcc::ClientEarlyCapabilityFlags::SUPPORT_DYN_VC_GFX_PROTOCOL));
                 let client_wants_message_channel = gcc_blocks.message_channel.is_some();
                 self.keyboard_layout = gcc_blocks.core.keyboard_layout;
 

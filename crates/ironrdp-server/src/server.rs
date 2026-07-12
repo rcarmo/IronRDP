@@ -1443,6 +1443,16 @@ impl RdpServer {
                 let response = server_encode_svc_messages(svc_responses, channel_id, result.user_channel_id)?;
                 writer.write_all(&response).await?;
             }
+        } else if let Some(channel_id) = self.get_channel_id_by_type::<dvc::DrdynvcServer>() {
+            let svc_responses = self
+                .get_svc_processor::<dvc::DrdynvcServer>()
+                .context("DRDYNVC processor missing during reactivation")?
+                .reactivate()?;
+            if !svc_responses.is_empty() {
+                debug!("Replaying pending DRDYNVC handshake after reactivation");
+                let response = server_encode_svc_messages(svc_responses, channel_id, result.user_channel_id)?;
+                writer.write_all(&response).await?;
+            }
         }
 
         let mut update_codecs = UpdateEncoderCodecs::new();

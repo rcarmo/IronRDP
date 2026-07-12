@@ -263,6 +263,25 @@ impl DrdynvcServer {
         as_svc_msg_with_flag(request).map(Some)
     }
 
+    /// Replays a capability request interrupted by Share Control
+    /// Deactivation-Reactivation.
+    ///
+    /// Static virtual channels survive reactivation, but some clients discard a
+    /// DRDYNVC capability request that races the boundary. Open DVCs and an
+    /// already-ready transport are left untouched.
+    pub fn reactivate(&mut self) -> PduResult<Vec<SvcMessage>> {
+        match self.state {
+            DrdynvcState::Initial => self.start(),
+            DrdynvcState::CapabilitiesSent => {
+                debug!("Replaying DRDYNVC Capabilities Request after reactivation");
+                let cap = CapabilitiesRequestPdu::new(CapsVersion::V2, None);
+                let req = DrdynvcServerPdu::Capabilities(cap);
+                Ok(alloc::vec![as_svc_msg_with_flag(req)?])
+            }
+            DrdynvcState::Ready | DrdynvcState::Failed => Ok(Vec::new()),
+        }
+    }
+
     fn channel_by_id(&mut self, id: u32) -> DecodeResult<&mut DynamicChannel> {
         self.dynamic_channels
             .get_mut(id)
@@ -367,6 +386,10 @@ impl SvcProcessor for DrdynvcServer {
         match pdu {
             DrdynvcClientPdu::Capabilities(caps_resp) => {
                 debug!("Got DVC Capabilities Response PDU: {caps_resp:?}");
+                if self.state == DrdynvcState::Ready {
+                    debug!("Ignoring duplicate DRDYNVC capability response");
+                    return Ok(resp);
+                }
                 if self.state != DrdynvcState::CapabilitiesSent {
                     return Err(pdu_other_err!("unexpected DRDYNVC capability response"));
                 }
@@ -530,6 +553,20 @@ mod tests {
     }
 
     #[test]
+    fn reactivation_replays_only_an_incomplete_capability_handshake() {
+        let mut server = DrdynvcServer::new().with_dynamic_channel(GraphicsChannel);
+        server.start().unwrap();
+
+        let replay = server.reactivate().unwrap();
+        assert_eq!(replay.len(), 1);
+        assert_eq!(server.state, DrdynvcState::CapabilitiesSent);
+
+        server.process(&[0x50, 0x00, 0x03, 0x00]).unwrap();
+        assert!(server.reactivate().unwrap().is_empty());
+        assert_eq!(server.state, DrdynvcState::Ready);
+    }
+
+    #[test]
     fn duplicate_capability_response_cannot_start_another_create() {
         let mut server = DrdynvcServer::new()
             .with_dynamic_channel(GraphicsChannel)
@@ -537,7 +574,8 @@ mod tests {
         server.start().unwrap();
 
         server.process(&[0x50, 0x00, 0x03, 0x00]).unwrap();
-        assert!(server.process(&[0x50, 0x00, 0x03, 0x00]).is_err());
+        let duplicate_response = server.process(&[0x50, 0x00, 0x03, 0x00]).unwrap();
+        assert!(duplicate_response.is_empty());
         assert_eq!(server.state, DrdynvcState::Ready);
         assert_eq!(server.dynamic_channels.get(1).unwrap().state, ChannelState::Creation);
         assert_eq!(server.dynamic_channels.get(2).unwrap().state, ChannelState::Pending);

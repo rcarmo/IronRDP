@@ -182,11 +182,8 @@ impl DrdynvcServer {
 
     /// Create at most one pending channel at a time.
     ///
-    /// Some Microsoft mobile clients stop processing when a server sends a
-    /// burst of CREATE_REQUEST PDUs immediately after capability negotiation.
-    /// Serialize creation and negotiate rdpgfx first, while retaining its
-    /// registered channel ID for compatibility with clients that remember the
-    /// original server topology.
+    /// Serialize channel creation and negotiate rdpgfx first, while retaining
+    /// its registered channel ID for compatibility with existing clients.
     fn create_next_pending(&mut self) -> PduResult<Option<SvcMessage>> {
         const RDPGFX_CHANNEL_NAME: &str = "Microsoft::Windows::RDS::Graphics";
 
@@ -210,7 +207,9 @@ impl DrdynvcServer {
             .dynamic_channels
             .get_mut(id)
             .ok_or_else(|| pdu_other_err!("selected dynamic channel disappeared"))?;
-        let request = DrdynvcServerPdu::Create(CreateRequestPdu::new(id, channel.processor.channel_name().into()));
+        let channel_name = channel.processor.channel_name();
+        debug!(channel_id = id, channel_name, "Sending serialized DVC Create Request");
+        let request = DrdynvcServerPdu::Create(CreateRequestPdu::new(id, channel_name.into()));
         channel.state = ChannelState::Creation;
         as_svc_msg_with_flag(request).map(Some)
     }

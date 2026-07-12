@@ -1679,8 +1679,16 @@ impl RdpServer {
 
                 if let Some(svc) = self.static_channels.get_by_channel_id_mut(data.channel_id) {
                     let response_pdus = svc.process(&data.user_data)?;
+                    let response_pdu_count = response_pdus.len();
                     let response = server_encode_svc_messages(response_pdus, data.channel_id, user_channel_id)?;
+                    debug!(
+                        channel_id = data.channel_id,
+                        response_pdu_count,
+                        encoded_bytes = response.len(),
+                        "Writing static-channel response"
+                    );
                     writer.write_all(&response).await?;
+                    debug!(channel_id = data.channel_id, "Static-channel response written");
                 } else {
                     warn!(channel_id = data.channel_id, "Unexpected channel received: ID",);
                 }

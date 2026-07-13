@@ -278,7 +278,26 @@ impl DrdynvcServer {
                 let req = DrdynvcServerPdu::Capabilities(cap);
                 Ok(alloc::vec![as_svc_msg(req)?])
             }
-            DrdynvcState::Ready | DrdynvcState::Failed => Ok(Vec::new()),
+            DrdynvcState::Ready => {
+                // Share Control reactivation does not close static channels, but
+                // desktop clients may discard a CREATE request that raced the
+                // boundary. Requeue only outstanding creates; opened channels
+                // and untouched pending channels retain their identities.
+                let mut replayed = false;
+                for (_, channel) in &mut self.dynamic_channels {
+                    if channel.state == ChannelState::Creation {
+                        channel.state = ChannelState::Pending;
+                        replayed = true;
+                    }
+                }
+                if replayed {
+                    debug!("Replaying outstanding DVC Create Request after reactivation");
+                    Ok(self.create_next_pending()?.into_iter().collect())
+                } else {
+                    Ok(Vec::new())
+                }
+            }
+            DrdynvcState::Failed => Ok(Vec::new()),
         }
     }
 
@@ -408,6 +427,10 @@ impl SvcProcessor for DrdynvcServer {
                 let id = create_resp.channel_id();
                 {
                     let channel = self.channel_by_id(id).map_err(|e| decode_err!(e))?;
+                    if channel.state == ChannelState::Opened {
+                        debug!(channel_id = id, "Ignoring duplicate DVC Create Response");
+                        return Ok(resp);
+                    }
                     if channel.state != ChannelState::Creation {
                         return Err(pdu_other_err!("invalid channel state"));
                     }
@@ -559,8 +582,29 @@ mod tests {
         assert_eq!(server.state, DrdynvcState::CapabilitiesSent);
 
         server.process(&[0x50, 0x00, 0x03, 0x00]).unwrap();
-        assert!(server.reactivate().unwrap().is_empty());
+        let create_replay = server.reactivate().unwrap();
+        assert_eq!(create_replay.len(), 1);
         assert_eq!(server.state, DrdynvcState::Ready);
+        assert_eq!(server.dynamic_channels.get(1).unwrap().state, ChannelState::Creation);
+    }
+
+    #[test]
+    fn duplicate_create_response_after_reactivation_is_idempotent() {
+        let mut server = DrdynvcServer::new()
+            .with_dynamic_channel(GraphicsChannel)
+            .with_dynamic_channel(OtherChannel);
+        server.start().unwrap();
+        server.process(&[0x50, 0x00, 0x03, 0x00]).unwrap();
+        server.reactivate().unwrap();
+
+        let next_create = server.process(&[0x10, 0x01, 0x00, 0x00, 0x00, 0x00]).unwrap();
+        assert_eq!(next_create.len(), 1);
+        assert_eq!(server.dynamic_channels.get(1).unwrap().state, ChannelState::Opened);
+        assert_eq!(server.dynamic_channels.get(2).unwrap().state, ChannelState::Creation);
+
+        let duplicate = server.process(&[0x10, 0x01, 0x00, 0x00, 0x00, 0x00]).unwrap();
+        assert!(duplicate.is_empty());
+        assert_eq!(server.dynamic_channels.get(2).unwrap().state, ChannelState::Creation);
     }
 
     #[test]

@@ -283,19 +283,30 @@ impl DrdynvcServer {
                 // desktop clients may discard a CREATE request that raced the
                 // boundary. Requeue only outstanding creates; opened channels
                 // and untouched pending channels retain their identities.
-                let mut replayed = false;
-                for (_, channel) in &mut self.dynamic_channels {
+                let mut replayed_ids = Vec::new();
+                for (id, channel) in &mut self.dynamic_channels {
                     if channel.state == ChannelState::Creation {
                         channel.state = ChannelState::Pending;
-                        replayed = true;
+                        replayed_ids.push(*id);
                     }
                 }
-                if replayed {
-                    debug!("Replaying outstanding DVC Create Request after reactivation");
-                    Ok(self.create_next_pending()?.into_iter().collect())
-                } else {
-                    Ok(Vec::new())
+                if replayed_ids.is_empty() {
+                    return Ok(Vec::new());
                 }
+
+                // Some desktop clients retain the original DVC object across
+                // reactivation while discarding its CREATE_RESPONSE. Close that
+                // client-side object before recreating the same stable ID.
+                let mut messages = Vec::with_capacity(replayed_ids.len() + 1);
+                for id in replayed_ids {
+                    debug!(channel_id = id, "Closing outstanding DVC before reactivation replay");
+                    messages.push(as_svc_msg(DrdynvcServerPdu::Close(ClosePdu::new(id)))?);
+                }
+                debug!("Replaying outstanding DVC Create Request after reactivation");
+                if let Some(create) = self.create_next_pending()? {
+                    messages.push(create);
+                }
+                Ok(messages)
             }
             DrdynvcState::Failed => Ok(Vec::new()),
         }
@@ -583,7 +594,7 @@ mod tests {
 
         server.process(&[0x50, 0x00, 0x03, 0x00]).unwrap();
         let create_replay = server.reactivate().unwrap();
-        assert_eq!(create_replay.len(), 1);
+        assert_eq!(create_replay.len(), 2); // CLOSE followed by CREATE
         assert_eq!(server.state, DrdynvcState::Ready);
         assert_eq!(server.dynamic_channels.get(1).unwrap().state, ChannelState::Creation);
     }
@@ -595,7 +606,8 @@ mod tests {
             .with_dynamic_channel(OtherChannel);
         server.start().unwrap();
         server.process(&[0x50, 0x00, 0x03, 0x00]).unwrap();
-        server.reactivate().unwrap();
+        let replay = server.reactivate().unwrap();
+        assert_eq!(replay.len(), 2); // CLOSE followed by CREATE
 
         let next_create = server.process(&[0x10, 0x01, 0x00, 0x00, 0x00, 0x00]).unwrap();
         assert_eq!(next_create.len(), 1);

@@ -40,6 +40,10 @@ struct DynamicChannel {
     processor: Box<dyn DvcProcessor>,
     complete_data: CompleteData,
     channel_id: u32,
+    /// A server-initiated CLOSE was sent solely to reset this stable ID before
+    /// reactivation replay; consume the client's CLOSE acknowledgement without
+    /// deleting the server-side channel object.
+    replay_close_pending: bool,
 }
 
 impl Drop for DynamicChannel {
@@ -120,6 +124,7 @@ impl DynamicChannel {
             processor: Box::new(processor),
             complete_data: CompleteData::new(),
             channel_id,
+            replay_close_pending: false,
         }
     }
 
@@ -287,6 +292,7 @@ impl DrdynvcServer {
                 for (id, channel) in &mut self.dynamic_channels {
                     if channel.state == ChannelState::Creation {
                         channel.state = ChannelState::Pending;
+                        channel.replay_close_pending = true;
                         replayed_ids.push(*id);
                     }
                 }
@@ -462,7 +468,19 @@ impl SvcProcessor for DrdynvcServer {
             DrdynvcClientPdu::Close(close) => {
                 debug!("Got DVC Close PDU: {close:?}");
                 let channel_id = close.channel_id();
-                self.remove_by_channel_id(channel_id);
+                let replay_ack = self.dynamic_channels.get_mut(channel_id).is_some_and(|channel| {
+                    if channel.replay_close_pending {
+                        channel.replay_close_pending = false;
+                        true
+                    } else {
+                        false
+                    }
+                });
+                if replay_ack {
+                    debug!(channel_id, "Consumed DVC replay CLOSE acknowledgement");
+                } else {
+                    self.remove_by_channel_id(channel_id);
+                }
             }
             DrdynvcClientPdu::Data(data) => {
                 let channel_id = data.channel_id();
@@ -608,6 +626,12 @@ mod tests {
         server.process(&[0x50, 0x00, 0x03, 0x00]).unwrap();
         let replay = server.reactivate().unwrap();
         assert_eq!(replay.len(), 2); // CLOSE followed by CREATE
+
+        // Client acknowledges the server-initiated CLOSE. The stable channel
+        // object must survive so the following CREATE_RESPONSE can route to it.
+        assert!(server.process(&[0x40, 0x01]).unwrap().is_empty());
+        assert_eq!(server.dynamic_channels.get(1).unwrap().state, ChannelState::Creation);
+        assert!(!server.dynamic_channels.get(1).unwrap().replay_close_pending);
 
         let next_create = server.process(&[0x10, 0x01, 0x00, 0x00, 0x00, 0x00]).unwrap();
         assert_eq!(next_create.len(), 1);

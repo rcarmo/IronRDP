@@ -2,6 +2,8 @@ use core::fmt;
 use core::net::SocketAddr;
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use core::time::Duration;
+#[cfg(feature = "egfx")]
+use std::num::NonZeroU32;
 use std::rc::Rc;
 use std::sync::{Arc, LazyLock, Mutex as StdMutex};
 use std::time::Instant;
@@ -55,6 +57,14 @@ use crate::{SoundServerFactory, builder, capabilities};
 /// TCP listen backlog size for the RDP server socket.
 const LISTENER_BACKLOG: u32 = 1024;
 const AUTO_RECONNECT_COOKIE_UPDATE_INTERVAL: Duration = Duration::from_secs(60 * 60);
+
+#[cfg(feature = "egfx")]
+fn client_core_frame_ack_limit(capabilities: &[CapabilitySet]) -> Option<NonZeroU32> {
+    capabilities.iter().find_map(|capability| match capability {
+        CapabilitySet::FrameAcknowledge(frame_ack) => NonZeroU32::new(frame_ack.max_unacknowledged_frame_count),
+        _ => None,
+    })
+}
 
 /// Monotonic milliseconds since first use, for feeding the auto-detect state machine.
 ///
@@ -1241,14 +1251,9 @@ impl RdpServer {
         let dvc = {
             let mut dvc = dvc;
             if let Some(gfx_factory) = self.gfx_factory.as_deref() {
-                if let Some((bridge, handle)) = gfx_factory.build_server_with_handle() {
-                    self.gfx_handle = Some(handle);
-                    dvc = dvc.with_dynamic_channel(bridge);
-                } else {
-                    let handler = gfx_factory.build_gfx_handler();
-                    let gfx_server = ironrdp_egfx::server::GraphicsPipelineServer::new(handler);
-                    dvc = dvc.with_dynamic_channel(gfx_server);
-                }
+                let (bridge, handle) = crate::gfx::build_server_and_handle(gfx_factory);
+                self.gfx_handle = Some(handle);
+                dvc = dvc.with_dynamic_channel(bridge);
             }
             dvc
         };
@@ -2060,6 +2065,9 @@ impl RdpServer {
             }
         }
 
+        #[cfg(feature = "egfx")]
+        let client_frame_ack_limit = client_core_frame_ack_limit(&result.capabilities);
+
         let mut update_codecs = UpdateEncoderCodecs::new();
         let mut surface_flags = CmdFlags::empty();
         for c in result.capabilities {
@@ -2147,6 +2155,21 @@ impl RdpServer {
                 }
                 _ => {}
             }
+        }
+
+        #[cfg(feature = "egfx")]
+        if let (Some(client_limit), Some(gfx_handle)) = (client_frame_ack_limit, self.gfx_handle.as_ref()) {
+            let mut gfx_server = gfx_handle
+                .lock()
+                .map_err(|_| anyhow::anyhow!("GfxServerHandle mutex poisoned"))?;
+            let configured_limit = gfx_server.max_frames_in_flight();
+            let effective_limit = gfx_server.clamp_max_frames_in_flight(client_limit);
+            debug!(
+                configured_limit,
+                client_limit = client_limit.get(),
+                effective_limit,
+                "clamped EGFX frame window to client core frame-ack capability"
+            );
         }
 
         let desktop_size = self.display.lock().await.size().await;
@@ -2721,6 +2744,33 @@ mod wrdp_reactivation_tests {
                 "backend unavailable",
             )))
         }
+    }
+
+    #[cfg(feature = "egfx")]
+    #[test]
+    fn client_core_frame_ack_limit_ignores_absent_and_zero_values() {
+        assert_eq!(client_core_frame_ack_limit(&[]), None);
+        assert_eq!(
+            client_core_frame_ack_limit(&[CapabilitySet::FrameAcknowledge(
+                rdp::capability_sets::FrameAcknowledge {
+                    max_unacknowledged_frame_count: 0,
+                },
+            )]),
+            None
+        );
+    }
+
+    #[cfg(feature = "egfx")]
+    #[test]
+    fn client_core_frame_ack_limit_preserves_nonzero_value() {
+        assert_eq!(
+            client_core_frame_ack_limit(&[CapabilitySet::FrameAcknowledge(
+                rdp::capability_sets::FrameAcknowledge {
+                    max_unacknowledged_frame_count: 1,
+                },
+            )]),
+            NonZeroU32::new(1)
+        );
     }
 
     fn creds(username: &str) -> Credentials {

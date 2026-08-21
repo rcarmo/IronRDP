@@ -56,6 +56,7 @@
 //! ```
 
 use std::collections::{HashMap, VecDeque};
+use std::num::NonZeroU32;
 use std::time::Instant;
 
 use ironrdp_core::{Encode, EncodeResult, WriteCursor, decode, impl_as_any};
@@ -487,8 +488,10 @@ pub struct FrameTracker {
     ack_suspended: bool,
     /// Next frame ID to assign
     next_frame_id: u32,
-    /// Maximum frames in flight before backpressure
-    max_in_flight: u32,
+    /// Operator-configured maximum frames in flight (zero means unlimited).
+    configured_max_in_flight: u32,
+    /// Optional non-zero ceiling advertised by the active client.
+    client_max_in_flight: Option<NonZeroU32>,
     /// Total frames sent
     total_sent: u64,
     /// Total frames acknowledged
@@ -509,15 +512,36 @@ impl FrameTracker {
             client_queue_depth: 0,
             ack_suspended: false,
             next_frame_id: 0,
-            max_in_flight: DEFAULT_MAX_FRAMES_IN_FLIGHT,
+            configured_max_in_flight: DEFAULT_MAX_FRAMES_IN_FLIGHT,
+            client_max_in_flight: None,
             total_sent: 0,
             total_acked: 0,
         }
     }
 
-    /// Set maximum frames in flight
+    /// Set the operator-configured maximum frames in flight.
+    ///
+    /// Zero means unlimited, while a negotiated client ceiling still applies.
     pub fn set_max_in_flight(&mut self, max: u32) {
-        self.max_in_flight = max;
+        self.configured_max_in_flight = max;
+    }
+
+    /// Store a non-zero client-advertised ceiling and return the effective limit.
+    fn clamp_max_in_flight(&mut self, client_max: NonZeroU32) -> u32 {
+        self.client_max_in_flight = Some(client_max);
+        self.max_in_flight()
+    }
+
+    /// Effective maximum number of frames permitted in flight.
+    ///
+    /// Zero means unlimited only when no client ceiling is present.
+    pub fn max_in_flight(&self) -> u32 {
+        match (self.configured_max_in_flight, self.client_max_in_flight) {
+            (0, None) => 0,
+            (0, Some(client)) => client.get(),
+            (configured, None) => configured,
+            (configured, Some(client)) => configured.min(client.get()),
+        }
     }
 
     /// Allocate a new frame ID and track it
@@ -548,6 +572,8 @@ impl FrameTracker {
 
     /// Handle frame acknowledgment from client
     pub fn acknowledge(&mut self, frame_id: u32, queue_depth: u32) -> Option<FrameInfo> {
+        let info = self.unacknowledged.remove(&frame_id)?;
+
         if queue_depth == SUSPEND_FRAME_ACK_QUEUE_DEPTH {
             self.ack_suspended = true;
             self.client_queue_depth = 0;
@@ -556,11 +582,8 @@ impl FrameTracker {
             self.client_queue_depth = queue_depth;
         }
 
-        let info = self.unacknowledged.remove(&frame_id);
-        if info.is_some() {
-            self.total_acked += 1;
-        }
-        info
+        self.total_acked += 1;
+        Some(info)
     }
 
     /// Number of frames in flight
@@ -575,7 +598,8 @@ impl FrameTracker {
 
     /// Check if backpressure should be applied
     pub fn should_backpressure(&self) -> bool {
-        !self.ack_suspended && self.in_flight() >= self.max_in_flight
+        let max_in_flight = self.max_in_flight();
+        !self.ack_suspended && max_in_flight != 0 && self.in_flight() >= max_in_flight
     }
 
     /// Get client queue depth
@@ -598,13 +622,59 @@ impl FrameTracker {
         self.total_acked
     }
 
-    /// Clear all tracking state
+    /// Clear all per-channel tracking state while preserving operator config.
     pub fn clear(&mut self) {
         self.unacknowledged.clear();
         self.client_queue_depth = 0;
         self.ack_suspended = false;
+        self.client_max_in_flight = None;
     }
 }
+
+/// Typed reason why an encoded frame could not be submitted to EGFX.
+///
+/// Backpressure is an expected transient flow-control condition. Callers must
+/// not treat it as an encoder or channel failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum FrameSubmissionError {
+    /// EGFX capability negotiation has not completed or the channel is closed.
+    NotReady,
+    /// The negotiated client capability does not include AVC420.
+    Avc420Unsupported,
+    /// The negotiated client capability does not include AVC444.
+    Avc444Unsupported,
+    /// The acknowledgement window is full.
+    Backpressured {
+        frames_in_flight: u32,
+        max_frames_in_flight: u32,
+    },
+    /// The requested surface does not exist.
+    UnknownSurface { surface_id: u16 },
+    /// A mixed-codec frame contained no tiles.
+    EmptyFrame,
+}
+
+impl core::fmt::Display for FrameSubmissionError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::NotReady => f.write_str("EGFX channel is not ready"),
+            Self::Avc420Unsupported => f.write_str("AVC420 is not supported by the client"),
+            Self::Avc444Unsupported => f.write_str("AVC444 is not supported by the client"),
+            Self::Backpressured {
+                frames_in_flight,
+                max_frames_in_flight,
+            } => write!(
+                f,
+                "EGFX acknowledgement window is full ({frames_in_flight}/{max_frames_in_flight})"
+            ),
+            Self::UnknownSurface { surface_id } => write!(f, "unknown EGFX surface {surface_id}"),
+            Self::EmptyFrame => f.write_str("mixed EGFX frame contains no tiles"),
+        }
+    }
+}
+
+impl core::error::Error for FrameSubmissionError {}
 
 // ============================================================================
 // Capability Negotiation
@@ -963,6 +1033,21 @@ impl GraphicsPipelineServer {
         }
     }
 
+    /// Reset all state owned by one DVC channel generation.
+    fn reset_channel_state(&mut self) {
+        self.state = ServerState::WaitingForCapabilities;
+        self.negotiated_caps = None;
+        self.codec_caps = CodecCapabilities::default();
+        self.surfaces = Surfaces::new();
+        self.frames.clear();
+        self.output_width = 0;
+        self.output_height = 0;
+        self.reset_graphics_sent = false;
+        self.output_queue.clear();
+        self.channel_id = None;
+        self.zgfx_compressor = Compressor::new();
+    }
+
     /// Create a server with ZGFX compression enabled for output.
     ///
     /// When `compression_mode` is `Auto` or `Always`, `drain_output()` will
@@ -1220,9 +1305,23 @@ impl GraphicsPipelineServer {
         self.frames.client_queue_depth()
     }
 
-    /// Set the maximum frames in flight before backpressure
+    /// Set the maximum frames in flight before backpressure.
     pub fn set_max_frames_in_flight(&mut self, max: u32) {
         self.frames.set_max_in_flight(max);
+    }
+
+    /// Clamp the configured frame window to a non-zero client-advertised limit.
+    ///
+    /// A configured value of zero is preserved for backward compatibility.
+    /// Returns the effective limit.
+    pub fn clamp_max_frames_in_flight(&mut self, client_max: NonZeroU32) -> u32 {
+        self.frames.clamp_max_in_flight(client_max)
+    }
+
+    /// Effective maximum number of frames in flight.
+    #[must_use]
+    pub fn max_frames_in_flight(&self) -> u32 {
+        self.frames.max_in_flight()
     }
 
     // ========================================================================
@@ -1307,34 +1406,47 @@ impl GraphicsPipelineServer {
         }
     }
 
-    /// Queue an H.264 AVC420 frame for transmission
-    ///
-    /// Returns `Some(frame_id)` if queued, `None` if backpressure is active,
-    /// server not ready, or AVC420 not supported.
-    pub fn send_avc420_frame(
+    /// Check whether an AVC420 frame can be submitted without encoding it.
+    pub fn avc420_submission_state(&self, surface_id: u16) -> Result<(), FrameSubmissionError> {
+        if !self.is_ready() {
+            return Err(FrameSubmissionError::NotReady);
+        }
+        if !self.supports_avc420() {
+            return Err(FrameSubmissionError::Avc420Unsupported);
+        }
+        if self.should_backpressure() {
+            return Err(FrameSubmissionError::Backpressured {
+                frames_in_flight: self.frames_in_flight(),
+                max_frames_in_flight: self.max_frames_in_flight(),
+            });
+        }
+        if self.surfaces.get(surface_id).is_none() {
+            return Err(FrameSubmissionError::UnknownSurface { surface_id });
+        }
+        Ok(())
+    }
+
+    /// Queue an H.264 AVC420 frame for transmission with a typed rejection.
+    pub fn try_send_avc420_frame(
         &mut self,
         surface_id: u16,
         h264_data: &[u8],
         regions: &[Avc420Region],
         timestamp_ms: u32,
-    ) -> Option<u32> {
-        if !self.is_ready() {
-            return None;
-        }
-        if !self.supports_avc420() {
-            return None;
-        }
-        if self.should_backpressure() {
-            self.qoe.record_backpressure();
-            return None;
+    ) -> Result<u32, FrameSubmissionError> {
+        if let Err(error) = self.avc420_submission_state(surface_id) {
+            if matches!(error, FrameSubmissionError::Backpressured { .. }) {
+                self.qoe.record_backpressure();
+            }
+            return Err(error);
         }
 
-        let surface = self.surfaces.get(surface_id)?;
-
+        let surface = self.surfaces.get(surface_id).expect("surface existence checked above");
         let timestamp = Self::make_timestamp(timestamp_ms);
         let frame_id = self.frames.begin_frame(timestamp);
 
         let encoded_stream = encode_avc420_bitmap_stream(regions, h264_data);
+        self.frames.set_frame_size(frame_id, encoded_stream.len());
         let target_rect = Self::compute_dest_rect(regions, surface.width, surface.height);
 
         // MS-RDPEGFX requires three-PDU sequence per frame
@@ -1351,16 +1463,46 @@ impl GraphicsPipelineServer {
 
         self.output_queue.push_back(GfxPdu::EndFrame(EndFramePdu { frame_id }));
 
-        Some(frame_id)
+        Ok(frame_id)
     }
 
-    /// Queue an H.264 AVC444 frame for transmission
+    /// Compatibility wrapper returning `None` for any submission rejection.
+    pub fn send_avc420_frame(
+        &mut self,
+        surface_id: u16,
+        h264_data: &[u8],
+        regions: &[Avc420Region],
+        timestamp_ms: u32,
+    ) -> Option<u32> {
+        self.try_send_avc420_frame(surface_id, h264_data, regions, timestamp_ms)
+            .ok()
+    }
+
+    /// Check whether an AVC444 frame can be submitted without encoding it.
+    pub fn avc444_submission_state(&self, surface_id: u16) -> Result<(), FrameSubmissionError> {
+        if !self.is_ready() {
+            return Err(FrameSubmissionError::NotReady);
+        }
+        if !self.supports_avc444() {
+            return Err(FrameSubmissionError::Avc444Unsupported);
+        }
+        if self.should_backpressure() {
+            return Err(FrameSubmissionError::Backpressured {
+                frames_in_flight: self.frames_in_flight(),
+                max_frames_in_flight: self.max_frames_in_flight(),
+            });
+        }
+        if self.surfaces.get(surface_id).is_none() {
+            return Err(FrameSubmissionError::UnknownSurface { surface_id });
+        }
+        Ok(())
+    }
+
+    /// Queue an H.264 AVC444 frame for transmission with a typed rejection.
     ///
     /// AVC444 uses two streams: luma (Y) and chroma (UV). Set `chroma_data` to
     /// `None` for luma-only transmission.
-    ///
-    /// Returns `Some(frame_id)` if queued, `None` if not supported or backpressured.
-    pub fn send_avc444_frame(
+    pub fn try_send_avc444_frame(
         &mut self,
         surface_id: u16,
         luma_data: &[u8],
@@ -1368,19 +1510,15 @@ impl GraphicsPipelineServer {
         chroma_data: Option<&[u8]>,
         chroma_regions: Option<&[Avc420Region]>,
         timestamp_ms: u32,
-    ) -> Option<u32> {
-        if !self.is_ready() {
-            return None;
-        }
-        if !self.supports_avc444() {
-            return None;
-        }
-        if self.should_backpressure() {
-            self.qoe.record_backpressure();
-            return None;
+    ) -> Result<u32, FrameSubmissionError> {
+        if let Err(error) = self.avc444_submission_state(surface_id) {
+            if matches!(error, FrameSubmissionError::Backpressured { .. }) {
+                self.qoe.record_backpressure();
+            }
+            return Err(error);
         }
 
-        let surface = self.surfaces.get(surface_id)?;
+        let surface = self.surfaces.get(surface_id).expect("surface existence checked above");
 
         let timestamp = Self::make_timestamp(timestamp_ms);
         let frame_id = self.frames.begin_frame(timestamp);
@@ -1417,6 +1555,7 @@ impl GraphicsPipelineServer {
         };
 
         let encoded_stream = encode_avc444_bitmap_stream(&avc444_stream);
+        self.frames.set_frame_size(frame_id, encoded_stream.len());
         let target_rect = Self::compute_dest_rect(luma_regions, surface.width, surface.height);
 
         self.output_queue
@@ -1432,7 +1571,28 @@ impl GraphicsPipelineServer {
 
         self.output_queue.push_back(GfxPdu::EndFrame(EndFramePdu { frame_id }));
 
-        Some(frame_id)
+        Ok(frame_id)
+    }
+
+    /// Compatibility wrapper returning `None` for any submission rejection.
+    pub fn send_avc444_frame(
+        &mut self,
+        surface_id: u16,
+        luma_data: &[u8],
+        luma_regions: &[Avc420Region],
+        chroma_data: Option<&[u8]>,
+        chroma_regions: Option<&[Avc420Region]>,
+        timestamp_ms: u32,
+    ) -> Option<u32> {
+        self.try_send_avc444_frame(
+            surface_id,
+            luma_data,
+            luma_regions,
+            chroma_data,
+            chroma_regions,
+            timestamp_ms,
+        )
+        .ok()
     }
 
     /// Queue a pre-encoded RDP6 Planar bitmap stream for transmission via EGFX.
@@ -1466,6 +1626,7 @@ impl GraphicsPipelineServer {
 
         let timestamp = Self::make_timestamp(timestamp_ms);
         let frame_id = self.frames.begin_frame(timestamp);
+        self.frames.set_frame_size(frame_id, planar_data.len());
         let destination_rectangle = ExclusiveRectangle {
             left: 0,
             top: 0,
@@ -1517,6 +1678,7 @@ impl GraphicsPipelineServer {
 
         let timestamp = Self::make_timestamp(timestamp_ms);
         let frame_id = self.frames.begin_frame(timestamp);
+        self.frames.set_frame_size(frame_id, bitmap_data.len());
 
         let dest_rect = ExclusiveRectangle {
             left: 0,
@@ -1563,6 +1725,7 @@ impl GraphicsPipelineServer {
             return None;
         }
         if self.should_backpressure() {
+            self.qoe.record_backpressure();
             return None;
         }
 
@@ -1570,6 +1733,7 @@ impl GraphicsPipelineServer {
 
         let timestamp = Self::make_timestamp(timestamp_ms);
         let frame_id = self.frames.begin_frame(timestamp);
+        self.frames.set_frame_size(frame_id, progressive_data.len());
 
         self.output_queue
             .push_back(GfxPdu::StartFrame(StartFramePdu { timestamp, frame_id }));
@@ -1616,6 +1780,7 @@ impl GraphicsPipelineServer {
 
         let timestamp = Self::make_timestamp(timestamp_ms);
         let frame_id = self.frames.begin_frame(timestamp);
+        self.frames.set_frame_size(frame_id, bitmap_data.len());
 
         self.output_queue
             .push_back(GfxPdu::StartFrame(StartFramePdu { timestamp, frame_id }));
@@ -1646,28 +1811,63 @@ impl GraphicsPipelineServer {
     /// This matches how Azure VDI achieves its visual quality — each tile uses
     /// the codec best suited to its content type.
     ///
-    /// Returns `Some(frame_id)` if queued, `None` if not ready or backpressured.
-    pub fn send_mixed_frame(
+    /// Return a typed reason when a mixed-codec frame cannot be submitted.
+    pub fn mixed_frame_submission_state(
+        &self,
+        surface_id: u16,
+        tiles: &[MixedTilePayload],
+    ) -> Result<(), FrameSubmissionError> {
+        if !self.is_ready() {
+            return Err(FrameSubmissionError::NotReady);
+        }
+        if tiles.is_empty() {
+            return Err(FrameSubmissionError::EmptyFrame);
+        }
+        if tiles.iter().any(|tile| matches!(tile, MixedTilePayload::Avc420 { .. })) && !self.supports_avc420() {
+            return Err(FrameSubmissionError::Avc420Unsupported);
+        }
+        if self.should_backpressure() {
+            return Err(FrameSubmissionError::Backpressured {
+                frames_in_flight: self.frames_in_flight(),
+                max_frames_in_flight: self.max_frames_in_flight(),
+            });
+        }
+        if self.surfaces.get(surface_id).is_none() {
+            return Err(FrameSubmissionError::UnknownSurface { surface_id });
+        }
+        Ok(())
+    }
+
+    /// Queue a mixed-codec frame with typed submission failures.
+    pub fn try_send_mixed_frame(
         &mut self,
         surface_id: u16,
         tiles: Vec<MixedTilePayload>,
         timestamp_ms: u32,
-    ) -> Option<u32> {
-        if !self.is_ready() {
-            return None;
-        }
-        if self.should_backpressure() {
-            return None;
-        }
-        if tiles.is_empty() {
-            return None;
+    ) -> Result<u32, FrameSubmissionError> {
+        if let Err(error) = self.mixed_frame_submission_state(surface_id, &tiles) {
+            if matches!(error, FrameSubmissionError::Backpressured { .. }) {
+                self.qoe.record_backpressure();
+            }
+            return Err(error);
         }
 
-        let surface = self.surfaces.get(surface_id)?;
+        let surface = self.surfaces.get(surface_id).expect("surface existence checked above");
         let pixel_format = surface.pixel_format;
 
         let timestamp = Self::make_timestamp(timestamp_ms);
+        let frame_size = tiles
+            .iter()
+            .map(|tile| match tile {
+                MixedTilePayload::ClearCodec { bitmap_data, .. } => bitmap_data.len(),
+                MixedTilePayload::RemoteFxProgressive { progressive_data, .. } => progressive_data.len(),
+                MixedTilePayload::Avc420 { regions, h264_data } => {
+                    encode_avc420_bitmap_stream(regions, h264_data).len()
+                }
+            })
+            .sum();
         let frame_id = self.frames.begin_frame(timestamp);
+        self.frames.set_frame_size(frame_id, frame_size);
 
         self.output_queue
             .push_back(GfxPdu::StartFrame(StartFramePdu { timestamp, frame_id }));
@@ -1715,7 +1915,17 @@ impl GraphicsPipelineServer {
 
         self.output_queue.push_back(GfxPdu::EndFrame(EndFramePdu { frame_id }));
 
-        Some(frame_id)
+        Ok(frame_id)
+    }
+
+    /// Compatibility wrapper returning `None` for any mixed-frame rejection.
+    pub fn send_mixed_frame(
+        &mut self,
+        surface_id: u16,
+        tiles: Vec<MixedTilePayload>,
+        timestamp_ms: u32,
+    ) -> Option<u32> {
+        self.try_send_mixed_frame(surface_id, tiles, timestamp_ms).ok()
     }
 
     // ========================================================================
@@ -1816,14 +2026,27 @@ impl GraphicsPipelineServer {
     }
 
     fn handle_frame_acknowledge(&mut self, pdu: FrameAcknowledgePdu) {
-        let queue_depth = pdu.queue_depth.to_u32();
-
-        if let Some(info) = self.frames.acknowledge(pdu.frame_id, queue_depth) {
-            let rtt = info.sent_at.elapsed();
-            self.qoe.record_rtt(rtt);
-            self.qoe.record_frame_ack(info.size_bytes);
-            trace!(frame_id = pdu.frame_id, latency = ?rtt);
+        if !self.is_ready() {
+            warn!(
+                frame_id = pdu.frame_id,
+                "Ignoring frame acknowledgement outside active EGFX generation"
+            );
+            return;
         }
+
+        let queue_depth = pdu.queue_depth.to_u32();
+        let Some(info) = self.frames.acknowledge(pdu.frame_id, queue_depth) else {
+            warn!(
+                frame_id = pdu.frame_id,
+                "Ignoring unknown or stale frame acknowledgement"
+            );
+            return;
+        };
+
+        let rtt = info.sent_at.elapsed();
+        self.qoe.record_rtt(rtt);
+        self.qoe.record_frame_ack(info.size_bytes);
+        trace!(frame_id = pdu.frame_id, latency = ?rtt);
 
         self.handler
             .on_frame_ack(pdu.frame_id, queue_depth, pdu.total_frames_decoded);
@@ -1857,6 +2080,9 @@ impl DvcProcessor for GraphicsPipelineServer {
     }
 
     fn start(&mut self, channel_id: u32) -> PduResult<Vec<DvcMessage>> {
+        // The core capability clamp is applied before the dynamic channel opens,
+        // so preserve it here. close() already clears the prior generation.
+        self.state = ServerState::WaitingForCapabilities;
         self.channel_id = Some(channel_id);
         debug!(channel_id, "EGFX channel started");
         Ok(vec![])
@@ -1864,8 +2090,8 @@ impl DvcProcessor for GraphicsPipelineServer {
 
     fn close(&mut self, _channel_id: u32) {
         debug!("EGFX channel closed");
+        self.reset_channel_state();
         self.state = ServerState::Closed;
-        self.reset_graphics_sent = false;
         self.handler.on_close();
     }
 

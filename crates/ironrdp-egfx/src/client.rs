@@ -1053,10 +1053,11 @@ impl GraphicsPipelineClient {
         self.handler.on_frame_complete(frame_id);
 
         // Per [3.3.5.12]: client MUST send FrameAcknowledge after EndFrame.
-        // We send the actual queue depth (not Unavailable / 0xFFFFFFFF as FreeRDP does);
-        // the real value gives the server backpressure information for frame pacing.
+        // QueueDepth is measured in bytes, not frames. Until the decoder tracks
+        // queued encoded bytes precisely, advertise the spec-defined unavailable
+        // value rather than mislabelling a frame count as bytes.
         let ack = GfxPdu::FrameAcknowledge(FrameAcknowledgePdu {
-            queue_depth: QueueDepth::from_u32(self.frames_queued),
+            queue_depth: QueueDepth::Unavailable,
             frame_id,
             total_frames_decoded: self.total_frames_decoded,
         });
@@ -1074,6 +1075,24 @@ impl DvcProcessor for GraphicsPipelineClient {
     }
 
     fn start(&mut self, _channel_id: u32) -> PduResult<Vec<DvcMessage>> {
+        // ZGFX history belongs to one DVC channel generation. The server resets
+        // its compressor on reopen, so the client must reset its decompressor too.
+        self.decompressor = zgfx::Decompressor::new();
+        self.decompressed_buffer.clear();
+        self.clearcodec_decoder = ClearCodecDecoder::new();
+        self.planar_decoder = BitmapStreamDecoder::default();
+        if let Some(decoder) = self.h264_decoder.as_mut() {
+            decoder.reset();
+        }
+        self.state = ClientState::WaitingForConfirm;
+        self.negotiated_caps = None;
+        self.codec_caps = CodecCapabilities::default();
+        self.surfaces.clear();
+        self.compositor = Compositor::default();
+        self.current_frame_id = None;
+        self.frames_queued = 0;
+        self.total_frames_decoded = 0;
+
         let caps = if self.h264_decoder.is_some() {
             self.handler.capabilities()
         } else {
@@ -1495,6 +1514,93 @@ mod tests {
             convert_rgb24_to_rgba(&rgb),
             vec![0x10, 0x20, 0x30, 0xFF, 0x40, 0x50, 0x60, 0xFF]
         );
+    }
+
+    #[test]
+    fn end_frame_reports_queue_depth_as_unavailable_bytes() {
+        use ironrdp_core::{Decode as _, WriteCursor};
+
+        let mut client = GraphicsPipelineClient::new(Box::new(TestHandler), None);
+        client.frames_queued = 2;
+        let responses = client.handle_end_frame(42).expect("EndFrame handling failed");
+        assert_eq!(responses.len(), 1);
+
+        let response = &responses[0];
+        let mut encoded = vec![0; response.size()];
+        response
+            .encode(&mut WriteCursor::new(&mut encoded))
+            .expect("ACK encoding failed");
+        let ack = GfxPdu::decode(&mut ReadCursor::new(&encoded)).expect("ACK decoding failed");
+        let GfxPdu::FrameAcknowledge(ack) = ack else {
+            panic!("expected FrameAcknowledge");
+        };
+        assert_eq!(ack.queue_depth, QueueDepth::Unavailable);
+    }
+
+    #[test]
+    fn compressed_payload_history_does_not_cross_reopen() {
+        use ironrdp_core::encode_vec;
+        use ironrdp_graphics::zgfx::{CompressionMode, Compressor, compress_and_wrap_egfx};
+
+        let pdu = GfxPdu::CapabilitiesConfirm(crate::pdu::CapabilitiesConfirmPdu::from_typed(&CapabilitySet::V8 {
+            flags: CapabilitiesV8Flags::empty(),
+        }));
+        let raw = encode_vec(&pdu).expect("PDU encoding failed");
+        let mut old_generation = Compressor::new();
+        let first = compress_and_wrap_egfx(&raw, &mut old_generation, CompressionMode::Always)
+            .expect("first compression failed");
+        let stale = compress_and_wrap_egfx(&raw, &mut old_generation, CompressionMode::Always)
+            .expect("history compression failed");
+
+        let mut client = GraphicsPipelineClient::new(Box::new(TestHandler), None);
+        client.start(1).expect("initial DVC start failed");
+        client.process(1, &first).expect("initial compressed payload failed");
+        client.close(1);
+        client.start(2).expect("reopened DVC start failed");
+        assert!(
+            client.process(2, &stale).is_err(),
+            "payload referencing the previous generation history must be rejected"
+        );
+
+        let mut fresh_generation = Compressor::new();
+        let fresh = compress_and_wrap_egfx(&raw, &mut fresh_generation, CompressionMode::Always)
+            .expect("fresh compression failed");
+        client
+            .process(2, &fresh)
+            .expect("fresh-generation compressed payload should decode");
+    }
+
+    #[test]
+    fn start_resets_client_channel_generation() {
+        let mut client = GraphicsPipelineClient::new(Box::new(TestHandler), None);
+        client.state = ClientState::Active;
+        client.negotiated_caps = Some(CapabilitySet::V8 {
+            flags: CapabilitiesV8Flags::empty(),
+        });
+        client.surfaces.insert(
+            1,
+            Surface {
+                id: 1,
+                width: 10,
+                height: 10,
+                pixel_format: PixelFormat::XRgb,
+                is_mapped: false,
+                output_origin_x: 0,
+                output_origin_y: 0,
+            },
+        );
+        client.current_frame_id = Some(7);
+        client.frames_queued = 1;
+        client.total_frames_decoded = 9;
+
+        client.start(2).expect("DVC start failed");
+
+        assert_eq!(client.state, ClientState::WaitingForConfirm);
+        assert!(client.negotiated_caps.is_none());
+        assert!(client.surfaces.is_empty());
+        assert!(client.current_frame_id.is_none());
+        assert_eq!(client.frames_queued, 0);
+        assert_eq!(client.total_frames_decoded, 0);
     }
 
     #[test]

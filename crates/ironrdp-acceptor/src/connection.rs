@@ -355,6 +355,14 @@ impl Acceptor {
         self.reactivation
     }
 
+    /// Whether the client supplied a well-formed Client Auto-Reconnect Packet.
+    ///
+    /// The server still has to verify its security verifier before accepting
+    /// the connection.
+    pub fn is_auto_reconnect_attempt(&self) -> bool {
+        self.received_auto_reconnect.is_some()
+    }
+
     pub fn is_ready_for_capability_exchange(&self) -> bool {
         matches!(self.state, AcceptorState::CapabilitiesSendServer { .. })
     }
@@ -366,11 +374,28 @@ impl Acceptor {
 
     /// Takes credentials received during the current handshake, if any.
     pub fn credentials_need_handling(&self) -> bool {
-        self.received_credentials.is_some() && !self.credentials_handled
+        !self.is_auto_reconnect_attempt() && self.received_credentials.is_some() && !self.credentials_handled
     }
 
     pub fn mark_credentials_handled(&mut self) {
         self.credentials_handled = true;
+    }
+
+    fn credentials_for_result(&mut self) -> Option<Credentials> {
+        self.received_credentials
+            .take()
+            .filter(|received| received.origin == CredentialOrigin::ClientInfo)
+            .map(|received| received.credentials)
+    }
+
+    /// Encode the protocol-defined access-denied response for a rejected
+    /// credential or capability-exchange hook.
+    pub fn encode_access_denied(&self, output: &mut WriteBuf) -> ConnectorResult<usize> {
+        let info = ServerSetErrorInfoPdu(ErrorInfo::ProtocolIndependentCode(
+            ProtocolIndependentCode::ServerDeniedConnection,
+        ));
+        debug!(message = ?info, "Send");
+        util::encode_send_data_indication(self.user_channel_id, self.io_channel_id, &info, output)
     }
 
     /// Store credentials delegated by CredSSP/NLA so server code can use the
@@ -418,7 +443,7 @@ impl Acceptor {
                 ime_file_name: self.ime_file_name.clone(),
                 multitransport_flags: self.multitransport_flags,
                 reactivation: self.reactivation,
-                credentials: self.received_credentials.take().map(|received| received.credentials),
+                credentials: self.credentials_for_result(),
                 auto_reconnect: self.received_auto_reconnect.take(),
             }),
             previous_state => {
@@ -890,14 +915,7 @@ impl Sequence for Acceptor {
                         if expected != &creds {
                             // FIXME: How authorization should be denied with standard RDP security?
                             // Since standard RDP security is not a priority, we just send a ServerDeniedConnection ServerSetErrorInfo PDU.
-                            let info = ServerSetErrorInfoPdu(ErrorInfo::ProtocolIndependentCode(
-                                ProtocolIndependentCode::ServerDeniedConnection,
-                            ));
-
-                            debug!(message = ?info, "Send");
-
-                            util::encode_send_data_indication(self.user_channel_id, self.io_channel_id, &info, output)?;
-
+                            self.encode_access_denied(output)?;
                             return Err(ConnectorError::general("invalid credentials"));
                         }
                     }
@@ -1096,6 +1114,74 @@ impl Sequence for Acceptor {
 
         self.state = next_state;
         Ok(written)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn credentials(username: &str) -> Credentials {
+        Credentials {
+            username: username.to_owned(),
+            password: "secret".to_owned(),
+            domain: None,
+        }
+    }
+
+    #[test]
+    fn acceptor_result_exposes_only_client_info_credentials() {
+        let mut acceptor = Acceptor::new(
+            SecurityProtocol::SSL,
+            DesktopSize {
+                width: 1024,
+                height: 768,
+            },
+            Vec::new(),
+            None,
+        );
+
+        acceptor.received_credentials = Some(ReceivedCredentials {
+            credentials: credentials("nla-user"),
+            origin: CredentialOrigin::CredSspDelegated,
+        });
+        assert!(acceptor.credentials_for_result().is_none());
+
+        acceptor.received_credentials = Some(ReceivedCredentials {
+            credentials: credentials("tls-user"),
+            origin: CredentialOrigin::ClientInfo,
+        });
+        assert_eq!(
+            acceptor
+                .credentials_for_result()
+                .expect("ClientInfo credentials should remain available")
+                .username,
+            "tls-user"
+        );
+    }
+
+    #[test]
+    fn auto_reconnect_defers_client_info_credentials() {
+        let mut acceptor = Acceptor::new(
+            SecurityProtocol::SSL,
+            DesktopSize {
+                width: 1024,
+                height: 768,
+            },
+            Vec::new(),
+            None,
+        );
+        acceptor.received_credentials = Some(ReceivedCredentials {
+            credentials: credentials("reconnect-user"),
+            origin: CredentialOrigin::ClientInfo,
+        });
+        acceptor.received_auto_reconnect = Some(ClientAutoReconnect {
+            logon_id: 7,
+            security_verifier: [0x5A; 16],
+        });
+
+        assert!(acceptor.is_auto_reconnect_attempt());
+        assert!(!acceptor.credentials_need_handling());
     }
 }
 
